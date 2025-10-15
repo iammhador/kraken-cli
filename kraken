@@ -6,7 +6,9 @@
 set -e
 
 KRAKEN_CONFIG=""
+KRAKEN_HOME="$HOME/.kraken-cli"
 INSTANCES_DIR="$HOME/.kraken/instances"
+NETWORKS_FILE="$KRAKEN_HOME/networks.json"
 mkdir -p "$INSTANCES_DIR"
 
 # Colors for output
@@ -294,29 +296,33 @@ configure_storage() {
 
 # Function to select network mode
 select_network() {
-  echo -e "\n${BLUE}Choose Network Mode:${NC}"
-  echo "  [1] NAT (Default - VM can access internet)"
-  echo "  [2] Bridged (VM gets IP on local network)"
-  echo "  [3] Private (VM isolated, host-only)"
-  read -p "Enter your choice [1-3]: " choice
-  case $choice in
-    1)
-      KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".network=\"nat\"")
-      echo -e "${GREEN}✓ NAT network selected${NC}"
-      ;;
-    2)
-      KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".network=\"bridged\"")
-      echo -e "${GREEN}✓ Bridged network selected${NC}"
-      ;;
-    3)
-      KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".network=\"private\"")
-      echo -e "${GREEN}✓ Private network selected${NC}"
-      ;;
-    *)
-      echo -e "${RED}Invalid choice. Please enter 1, 2, or 3.${NC}"
-      select_network
-      ;;
-  esac
+  echo -e "\n${BLUE}Fetching current network usage...${NC}"
+
+  # Read network info dynamically
+  for network in Telnet1 Telnet2; do
+    max_capacity=$(jq -r ".\"$network\"" "$NETWORKS_FILE")
+    current_usage=$(grep -rl "\"network\": \"$network\"" "$INSTANCES_DIR" | wc -l)
+    remaining=$((max_capacity - current_usage))
+
+    echo "  [$((++count))] $network — $current_usage/$max_capacity in use ($remaining available)"
+    eval "network_$count=$network"
+    eval "remaining_$count=$remaining"
+  done
+
+  echo ""
+  read -p "Enter your choice [1-2]: " choice
+
+  selected_network=$(eval echo \$network_$choice)
+  available=$(eval echo \$remaining_$choice)
+
+  if [ "$available" -le 0 ]; then
+    echo -e "${RED}Network $selected_network is full. Choose another.${NC}"
+    select_network
+    return
+  fi
+
+  KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".network=\"$selected_network\"")
+  echo -e "${GREEN}✓ $selected_network network selected${NC}"
 }
 
 # Function to set instance name
@@ -365,10 +371,12 @@ Vagrant.configure("2") do |config|
   # Network configuration
 EOF
 
-  if [ "$network" = "bridged" ]; then
-    echo '  config.vm.network "public_network"' >> "$instance_dir/Vagrantfile"
-  elif [ "$network" = "private" ]; then
-    echo '  config.vm.network "private_network", type: "dhcp"' >> "$instance_dir/Vagrantfile"
+  if [ "$network" = "Telnet1" ]; then
+    echo '  config.vm.network "private_network", virtualbox__intnet: "Telnet1"' >> "$instance_dir/Vagrantfile"
+    echo '  config.vm.network "private_network", libvirt__network_name: "Telnet1"' >> "$instance_dir/Vagrantfile"
+  elif [ "$network" = "Telnet2" ]; then
+    echo '  config.vm.network "private_network", virtualbox__intnet: "Telnet2"' >> "$instance_dir/Vagrantfile"
+    echo '  config.vm.network "private_network", libvirt__network_name: "Telnet2"' >> "$instance_dir/Vagrantfile"
   fi
 
   cat >> "$instance_dir/Vagrantfile" <<EOF
