@@ -1,0 +1,560 @@
+#!/bin/bash
+
+# Kraken CLI - AWS-like VM instance launcher
+# Supports libvirt/KVM (recommended) and VirtualBox
+
+set -e
+
+KRAKEN_CONFIG=""
+INSTANCES_DIR="$HOME/.kraken/instances"
+mkdir -p "$INSTANCES_DIR"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Function to display usage
+usage() {
+  echo -e "${BLUE}🦑 Kraken CLI - AWS-like VM Launcher${NC}"
+  echo ""
+  echo "Usage: kraken <command> [options]"
+  echo ""
+  echo "Commands:"
+  echo "  init           Initialize and launch a new VM instance"
+  echo "  list           List all running instances"
+  echo "  stop <name>    Stop a running instance"
+  echo "  start <name>   Start a stopped instance"
+  echo "  ssh <name>     SSH into an instance"
+  echo "  destroy <name> Destroy an instance"
+  echo "  status <name>  Show instance status"
+  echo ""
+  echo "Examples:"
+  echo "  kraken init              # Launch new instance (interactive)"
+  echo "  kraken list              # List all instances"
+  echo "  kraken ssh my-instance   # SSH into instance"
+  exit 1
+}
+
+# Function to select VM provider
+select_provider() {
+  echo -e "\n${BLUE}Choose VM Provider:${NC}"
+  echo "  [1] libvirt/KVM (Recommended - Better performance, native Linux)"
+  echo "  [2] VirtualBox (May have kernel compatibility issues)"
+  read -p "Enter your choice [1-2]: " choice
+  case $choice in
+    1)
+      KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".provider=\"libvirt\"")
+      echo -e "${GREEN}✓ Using libvirt/KVM${NC}"
+      ;;
+    2)
+      KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".provider=\"virtualbox\"")
+      echo -e "${YELLOW}⚠ Warning: VirtualBox may have issues with kernel 6.16+${NC}"
+      ;;
+    *)
+      echo -e "${RED}Invalid choice. Please enter 1 or 2.${NC}"
+      select_provider
+      ;;
+  esac
+}
+
+# Function to select OS
+select_os() {
+  echo -e "\n${BLUE}Choose Operating System:${NC}"
+  echo "  [1] Ubuntu 22.04 LTS (Recommended)"
+  echo "  [2] Ubuntu 20.04 LTS"
+  echo "  [3] Ubuntu 18.04 LTS"
+  echo "  [4] Debian 12"
+  echo "  [5] CentOS Stream 9"
+  echo "  [6] Rocky Linux 9"
+  read -p "Enter your choice [1-6]: " choice
+
+  provider=$(echo $KRAKEN_CONFIG | jq -r ".provider")
+
+  case $choice in
+    1)
+      if [ "$provider" = "libvirt" ]; then
+        box="generic/ubuntu2204"
+      else
+        box="ubuntu/jammy64"
+      fi
+      os_name="Ubuntu 22.04 LTS"
+      ;;
+    2)
+      if [ "$provider" = "libvirt" ]; then
+        box="generic/ubuntu2004"
+      else
+        box="ubuntu/focal64"
+      fi
+      os_name="Ubuntu 20.04 LTS"
+      ;;
+    3)
+      if [ "$provider" = "libvirt" ]; then
+        box="generic/ubuntu1804"
+      else
+        box="ubuntu/bionic64"
+      fi
+      os_name="Ubuntu 18.04 LTS"
+      ;;
+    4)
+      box="generic/debian12"
+      os_name="Debian 12"
+      ;;
+    5)
+      box="generic/centos9s"
+      os_name="CentOS Stream 9"
+      ;;
+    6)
+      box="generic/rocky9"
+      os_name="Rocky Linux 9"
+      ;;
+    *)
+      echo -e "${RED}Invalid choice. Please enter 1-6.${NC}"
+      select_os
+      return
+      ;;
+  esac
+
+  KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".box=\"$box\" | .os_name=\"$os_name\"")
+  echo -e "${GREEN}✓ Selected: $os_name${NC}"
+}
+
+# Function to configure CPU
+configure_cpu() {
+  total_cpus=$(nproc)
+  echo -e "\n${BLUE}CPU Configuration:${NC}"
+  echo "  [1] Show available CPU details"
+  echo "  [2] Use default (2 cores)"
+  echo "  [3] Enter custom CPU allocation"
+  read -p "Enter your choice [1-3]: " choice
+  case $choice in
+    1)
+      echo -e "${YELLOW}Total CPUs: $total_cpus${NC}"
+      echo -e "${YELLOW}Recommended: 2-4 cores for general use${NC}"
+      configure_cpu
+      ;;
+    2)
+      KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".cpu=2")
+      echo -e "${GREEN}✓ 2 CPU cores selected${NC}"
+      ;;
+    3)
+      read -p "Enter CPU cores to allocate (1-$total_cpus): " cpu_cores
+      if [[ $cpu_cores =~ ^[0-9]+$ ]] && (( cpu_cores >= 1 && cpu_cores <= total_cpus )); then
+        KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".cpu=$cpu_cores")
+        echo -e "${GREEN}✓ $cpu_cores CPU cores selected${NC}"
+      else
+        echo -e "${RED}Invalid input. Please enter a number between 1 and $total_cpus.${NC}"
+        configure_cpu
+      fi
+      ;;
+    *)
+      echo -e "${RED}Invalid choice. Please enter 1, 2, or 3.${NC}"
+      configure_cpu
+      ;;
+  esac
+}
+
+# Function to configure RAM
+configure_ram() {
+  total_ram_mb=$(free -m | awk '/Mem:/ {print $2}')
+  echo -e "\n${BLUE}RAM Configuration:${NC}"
+  echo "  [1] Show available RAM details"
+  echo "  [2] Use default (2048 MB / 2 GB)"
+  echo "  [3] Enter custom RAM allocation"
+  read -p "Enter your choice [1-3]: " choice
+  case $choice in
+    1)
+      echo -e "${YELLOW}Total RAM: $total_ram_mb MB${NC}"
+      echo -e "${YELLOW}Recommended: 2048-4096 MB for general use${NC}"
+      configure_ram
+      ;;
+    2)
+      KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".ram=2048")
+      echo -e "${GREEN}✓ 2048 MB (2 GB) selected${NC}"
+      ;;
+    3)
+      read -p "Enter RAM to allocate in MB (512-$total_ram_mb): " ram_mb
+      if [[ $ram_mb =~ ^[0-9]+$ ]] && (( ram_mb >= 512 && ram_mb <= total_ram_mb )); then
+        KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".ram=$ram_mb")
+        echo -e "${GREEN}✓ $ram_mb MB selected${NC}"
+      else
+        echo -e "${RED}Invalid input. Please enter a number between 512 and $total_ram_mb.${NC}"
+        configure_ram
+      fi
+      ;;
+    *)
+      echo -e "${RED}Invalid choice. Please enter 1, 2, or 3.${NC}"
+      configure_ram
+      ;;
+  esac
+}
+
+# Function to configure storage
+configure_storage() {
+  echo -e "\n${BLUE}Storage Configuration:${NC}"
+  echo "  [1] Use default (20 GB)"
+  echo "  [2] Enter custom storage allocation"
+  read -p "Enter your choice [1-2]: " choice
+  case $choice in
+    1)
+      KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".storage=20")
+      echo -e "${GREEN}✓ 20 GB selected${NC}"
+      ;;
+    2)
+      read -p "Enter storage in GB (10-500): " storage_gb
+      if [[ $storage_gb =~ ^[0-9]+$ ]] && (( storage_gb >= 10 && storage_gb <= 500 )); then
+        KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".storage=$storage_gb")
+        echo -e "${GREEN}✓ $storage_gb GB selected${NC}"
+      else
+        echo -e "${RED}Invalid input. Please enter a number between 10 and 500.${NC}"
+        configure_storage
+      fi
+      ;;
+    *)
+      echo -e "${RED}Invalid choice. Please enter 1 or 2.${NC}"
+      configure_storage
+      ;;
+  esac
+}
+
+# Function to select network mode
+select_network() {
+  echo -e "\n${BLUE}Choose Network Mode:${NC}"
+  echo "  [1] NAT (Default - VM can access internet)"
+  echo "  [2] Bridged (VM gets IP on local network)"
+  echo "  [3] Private (VM isolated, host-only)"
+  read -p "Enter your choice [1-3]: " choice
+  case $choice in
+    1)
+      KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".network=\"nat\"")
+      echo -e "${GREEN}✓ NAT network selected${NC}"
+      ;;
+    2)
+      KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".network=\"bridged\"")
+      echo -e "${GREEN}✓ Bridged network selected${NC}"
+      ;;
+    3)
+      KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".network=\"private\"")
+      echo -e "${GREEN}✓ Private network selected${NC}"
+      ;;
+    *)
+      echo -e "${RED}Invalid choice. Please enter 1, 2, or 3.${NC}"
+      select_network
+      ;;
+  esac
+}
+
+# Function to set instance name
+set_instance_name() {
+  echo -e "\n${BLUE}Instance Name:${NC}"
+  read -p "Enter a name for your instance (e.g., web-server-1): " instance_name
+  if [[ -z "$instance_name" ]]; then
+    instance_name="kraken-$(date +%s)"
+    echo -e "${YELLOW}Using auto-generated name: $instance_name${NC}"
+  fi
+  KRAKEN_CONFIG=$(echo $KRAKEN_CONFIG | jq ".name=\"$instance_name\"")
+}
+
+# Function to generate Vagrantfile
+generate_vagrantfile() {
+  local instance_name=$(echo $KRAKEN_CONFIG | jq -r ".name")
+  local instance_dir="$INSTANCES_DIR/$instance_name"
+  local provider=$(echo $KRAKEN_CONFIG | jq -r ".provider")
+  local box=$(echo $KRAKEN_CONFIG | jq -r ".box")
+  local cpu=$(echo $KRAKEN_CONFIG | jq -r ".cpu")
+  local ram=$(echo $KRAKEN_CONFIG | jq -r ".ram")
+  local network=$(echo $KRAKEN_CONFIG | jq -r ".network")
+
+  mkdir -p "$instance_dir"
+
+  cat > "$instance_dir/Vagrantfile" <<EOF
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "$box"
+  config.vm.hostname = "$instance_name"
+
+  # Network configuration
+EOF
+
+  if [ "$network" = "bridged" ]; then
+    echo '  config.vm.network "public_network"' >> "$instance_dir/Vagrantfile"
+  elif [ "$network" = "private" ]; then
+    echo '  config.vm.network "private_network", type: "dhcp"' >> "$instance_dir/Vagrantfile"
+  fi
+
+  cat >> "$instance_dir/Vagrantfile" <<EOF
+
+  # Provider-specific configuration
+  config.vm.provider "$provider" do |v|
+    v.memory = $ram
+    v.cpus = $cpu
+EOF
+
+  if [ "$provider" = "libvirt" ]; then
+    cat >> "$instance_dir/Vagrantfile" <<EOF
+    v.driver = "kvm"
+EOF
+  fi
+
+  cat >> "$instance_dir/Vagrantfile" <<EOF
+  end
+
+  # Provisioning
+  config.vm.provision "shell", inline: <<-SHELL
+    echo "🦑 Kraken instance initialized!"
+    echo "Instance: $instance_name"
+    echo "OS: $box"
+    echo "CPU: $cpu cores"
+    echo "RAM: $ram MB"
+  SHELL
+end
+EOF
+
+  echo "$instance_dir"
+}
+
+# Function to review and confirm
+review_and_confirm() {
+  echo ""
+  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${BLUE}🦑 Kraken Instance Configuration Summary${NC}"
+  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "Instance : ${GREEN}$(echo $KRAKEN_CONFIG | jq -r ".name")${NC}"
+  echo -e "OS       : ${GREEN}$(echo $KRAKEN_CONFIG | jq -r ".os_name")${NC}"
+  echo -e "Provider : ${GREEN}$(echo $KRAKEN_CONFIG | jq -r ".provider")${NC}"
+  echo -e "CPU      : ${GREEN}$(echo $KRAKEN_CONFIG | jq -r ".cpu") cores${NC}"
+  echo -e "RAM      : ${GREEN}$(echo $KRAKEN_CONFIG | jq -r ".ram") MB${NC}"
+  echo -e "Storage  : ${GREEN}$(echo $KRAKEN_CONFIG | jq -r ".storage") GB${NC}"
+  echo -e "Network  : ${GREEN}$(echo $KRAKEN_CONFIG | jq -r ".network")${NC}"
+  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+  read -p "Launch instance? [Y/n]: " confirm
+
+  if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
+    launch_instance
+  else
+    echo -e "${YELLOW}Launch cancelled.${NC}"
+    exit 0
+  fi
+}
+
+# Function to launch instance
+launch_instance() {
+  local instance_name=$(echo $KRAKEN_CONFIG | jq -r ".name")
+  local provider=$(echo $KRAKEN_CONFIG | jq -r ".provider")
+
+  echo ""
+  echo -e "${BLUE}🚀 Launching instance: $instance_name${NC}"
+
+  # Generate Vagrantfile
+  local instance_dir=$(generate_vagrantfile)
+
+  # Save config
+  echo "$KRAKEN_CONFIG" | jq . > "$instance_dir/kraken-config.json"
+
+  # Launch VM
+  cd "$instance_dir"
+  echo -e "${YELLOW}This may take a few minutes...${NC}"
+
+  if vagrant up --provider=$provider; then
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}✓ Instance '$instance_name' launched successfully!${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo "Useful commands:"
+    echo "  kraken ssh $instance_name      # SSH into instance"
+    echo "  kraken status $instance_name   # Check status"
+    echo "  kraken stop $instance_name     # Stop instance"
+    echo "  kraken destroy $instance_name  # Delete instance"
+    echo ""
+  else
+    echo -e "${RED}✗ Failed to launch instance${NC}"
+    exit 1
+  fi
+}
+
+# Function to list instances
+list_instances() {
+  echo -e "${BLUE}🦑 Kraken Instances${NC}"
+  echo ""
+
+  if [ ! -d "$INSTANCES_DIR" ] || [ -z "$(ls -A $INSTANCES_DIR 2>/dev/null)" ]; then
+    echo -e "${YELLOW}No instances found${NC}"
+    return
+  fi
+
+  printf "%-20s %-15s %-10s %-15s\n" "NAME" "OS" "STATUS" "PROVIDER"
+  echo "────────────────────────────────────────────────────────────────"
+
+  for instance_dir in "$INSTANCES_DIR"/*; do
+    if [ -d "$instance_dir" ]; then
+      instance_name=$(basename "$instance_dir")
+      cd "$instance_dir"
+
+      if [ -f "kraken-config.json" ]; then
+        os_name=$(jq -r ".os_name" kraken-config.json)
+        provider=$(jq -r ".provider" kraken-config.json)
+      else
+        os_name="Unknown"
+        provider="Unknown"
+      fi
+
+      status=$(vagrant status 2>/dev/null | grep "default" | awk '{print $2}')
+      [ -z "$status" ] && status="unknown"
+
+      printf "%-20s %-15s %-10s %-15s\n" "$instance_name" "$os_name" "$status" "$provider"
+    fi
+  done
+}
+
+# Function to SSH into instance
+ssh_instance() {
+  local instance_name=$1
+  local instance_dir="$INSTANCES_DIR/$instance_name"
+
+  if [ ! -d "$instance_dir" ]; then
+    echo -e "${RED}Instance '$instance_name' not found${NC}"
+    exit 1
+  fi
+
+  cd "$instance_dir"
+  vagrant ssh
+}
+
+# Function to stop instance
+stop_instance() {
+  local instance_name=$1
+  local instance_dir="$INSTANCES_DIR/$instance_name"
+
+  if [ ! -d "$instance_dir" ]; then
+    echo -e "${RED}Instance '$instance_name' not found${NC}"
+    exit 1
+  fi
+
+  cd "$instance_dir"
+  echo -e "${YELLOW}Stopping instance: $instance_name${NC}"
+  vagrant halt
+  echo -e "${GREEN}✓ Instance stopped${NC}"
+}
+
+# Function to start instance
+start_instance() {
+  local instance_name=$1
+  local instance_dir="$INSTANCES_DIR/$instance_name"
+
+  if [ ! -d "$instance_dir" ]; then
+    echo -e "${RED}Instance '$instance_name' not found${NC}"
+    exit 1
+  fi
+
+  cd "$instance_dir"
+  echo -e "${YELLOW}Starting instance: $instance_name${NC}"
+  vagrant up
+  echo -e "${GREEN}✓ Instance started${NC}"
+}
+
+# Function to destroy instance
+destroy_instance() {
+  local instance_name=$1
+  local instance_dir="$INSTANCES_DIR/$instance_name"
+
+  if [ ! -d "$instance_dir" ]; then
+    echo -e "${RED}Instance '$instance_name' not found${NC}"
+    exit 1
+  fi
+
+  read -p "Are you sure you want to destroy '$instance_name'? [y/N]: " confirm
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    cd "$instance_dir"
+    echo -e "${YELLOW}Destroying instance: $instance_name${NC}"
+    vagrant destroy -f
+    cd ..
+    rm -rf "$instance_dir"
+    echo -e "${GREEN}✓ Instance destroyed${NC}"
+  else
+    echo -e "${YELLOW}Cancelled${NC}"
+  fi
+}
+
+# Function to show instance status
+show_status() {
+  local instance_name=$1
+  local instance_dir="$INSTANCES_DIR/$instance_name"
+
+  if [ ! -d "$instance_dir" ]; then
+    echo -e "${RED}Instance '$instance_name' not found${NC}"
+    exit 1
+  fi
+
+  cd "$instance_dir"
+  echo -e "${BLUE}Instance: $instance_name${NC}"
+  echo ""
+  vagrant status
+}
+
+# Main logic
+case "$1" in
+  init)
+    echo -e "${BLUE}🦑 Welcome to Kraken CLI - AWS-like VM Launcher${NC}"
+    KRAKEN_CONFIG="{}"
+    select_provider
+    select_os
+    configure_cpu
+    configure_ram
+    configure_storage
+    select_network
+    set_instance_name
+    review_and_confirm
+    ;;
+  list|ls)
+    list_instances
+    ;;
+  ssh)
+    if [ -z "$2" ]; then
+      echo -e "${RED}Error: Instance name required${NC}"
+      echo "Usage: kraken ssh <instance-name>"
+      exit 1
+    fi
+    ssh_instance "$2"
+    ;;
+  stop)
+    if [ -z "$2" ]; then
+      echo -e "${RED}Error: Instance name required${NC}"
+      echo "Usage: kraken stop <instance-name>"
+      exit 1
+    fi
+    stop_instance "$2"
+    ;;
+  start)
+    if [ -z "$2" ]; then
+      echo -e "${RED}Error: Instance name required${NC}"
+      echo "Usage: kraken start <instance-name>"
+      exit 1
+    fi
+    start_instance "$2"
+    ;;
+  destroy)
+    if [ -z "$2" ]; then
+      echo -e "${RED}Error: Instance name required${NC}"
+      echo "Usage: kraken destroy <instance-name>"
+      exit 1
+    fi
+    destroy_instance "$2"
+    ;;
+  status)
+    if [ -z "$2" ]; then
+      echo -e "${RED}Error: Instance name required${NC}"
+      echo "Usage: kraken status <instance-name>"
+      exit 1
+    fi
+    show_status "$2"
+    ;;
+  *)
+    usage
+    ;;
+esac
