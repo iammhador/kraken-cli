@@ -54,47 +54,21 @@ check_dependencies() {
     missing_deps+=("curl or wget")
   fi
   
-  # Check for jq
-  if ! command -v jq >/dev/null 2>&1; then
-    print_warning "jq is not installed. It's required for Kraken CLI to work."
-    missing_deps+=("jq")
-  fi
-  
-  # Check for vagrant
-  if ! command -v vagrant >/dev/null 2>&1; then
-    print_warning "Vagrant is not installed. It's required for Kraken CLI to work."
-    missing_deps+=("vagrant")
-  fi
-  
-  if [ ${#missing_deps[@]} -gt 0 ]; then
+  # Only fail if curl/wget is missing
+  if [[ " ${missing_deps[*]} " =~ "curl or wget" ]]; then
     print_warning "Missing dependencies: ${missing_deps[*]}"
     echo ""
-    print_info "Please install the missing dependencies:"
-    
+    print_info "Please install curl or wget:"
     if [[ "$OS" == "Linux" ]]; then
-      echo ""
-      echo "For Fedora/RHEL:"
-      echo "  sudo dnf install -y jq vagrant vagrant-libvirt @virtualization"
-      echo ""
-      echo "For Ubuntu/Debian:"
-      echo "  sudo apt update"
-      echo "  sudo apt install -y jq vagrant"
-      echo ""
-      echo "For Arch Linux:"
-      echo "  sudo pacman -S jq vagrant"
+      echo "  sudo dnf install -y curl    # Fedora/RHEL"
+      echo "  sudo apt install -y curl    # Ubuntu/Debian"
     elif [[ "$OS" == "macOS" ]]; then
-      echo ""
-      echo "For macOS (using Homebrew):"
-      echo "  brew install jq vagrant"
+      echo "  brew install curl"
     fi
-    
-    echo ""
-    read -p "Continue installation anyway? [y/N]: " continue_install
-    if [[ ! "$continue_install" =~ ^[Yy]$ ]]; then
-      exit 1
-    fi
+    exit 1
   fi
 }
+
 
 # Create installation directory
 create_install_dir() {
